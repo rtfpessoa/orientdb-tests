@@ -1,11 +1,12 @@
 import java.security.SecureRandom
 import java.util.UUID
 
-import com.orientechnologies.orient.core.id.ORID
-import com.orientechnologies.orient.core.metadata.schema.OType
+import com.orientechnologies.orient.core.id.ORecordId
+import com.orientechnologies.orient.core.metadata.schema.{OClass, OType}
 import gremlin.scala._
 import org.apache.tinkerpop.gremlin.orientdb._
 
+import scala.reflect.ClassTag
 import scala.util.Random
 
 object Test {
@@ -30,7 +31,7 @@ object Test {
       (s"$dbType:$dbPath", "root", "1234")
     }
 
-    val (dbUrl, dbUser, dbPassword): (String, String, String) = remote
+    val (dbUrl, dbUser, dbPassword): (String, String, String) = memory
 
     val graphOrient: OrientGraph = new OrientGraphFactory(dbUrl, dbUser, dbPassword)
       .setupPool(1, 10)
@@ -47,11 +48,11 @@ object Test {
     val commit4: Vertex = graph.withVertex(Gen.commits().head)
     val commit5: Vertex = graph.withVertex(Gen.commits().head)
 
-    commit1 --- "isFirstParent" --> commit2
-    commit2 --- "isFirstParent" --> commit3
-    commit2 --- "isFirstParent" --> commit4
-    commit3 --- "isSecondParent" --> commit5
-    commit4 --- "isFirstParent" --> commit5
+    commit1 --- Commit.Edges.FirstParent --> commit2
+    commit2 --- Commit.Edges.FirstParent --> commit3
+    commit2 --- Commit.Edges.FirstParent --> commit4
+    commit3 --- Commit.Edges.SecondParent --> commit5
+    commit4 --- Commit.Edges.FirstParent --> commit5
 
     val pattern1: Vertex = graph.withVertex(Gen.patterns().head)
     val pattern2: Vertex = graph.withVertex(Gen.patterns().head)
@@ -60,17 +61,17 @@ object Test {
     val result2: Vertex = graph.withVertex(Gen.results(pattern2).head)
     val result3: Vertex = graph.withVertex(Gen.results(pattern2).head)
 
-    commit1 --- "hasNew" --> result1
-    commit1 --- "hasNew" --> result2
-    commit2 --- "hasFixed" --> result2
+    commit1 --- Commit.Edges.Introduces --> result1
+    commit1 --- Commit.Edges.Introduces --> result2
+    commit2 --- Commit.Edges.Fixes --> result2
 
-    commit2 --- "hasUnchanged" --> result1
-    commit3 --- "hasUnchanged" --> result1
+    commit2 --- Commit.Edges.Keeps --> result1
+    commit3 --- Commit.Edges.Keeps --> result1
 
-    commit4 --- "hasFixed" --> result1
-    commit4 --- "hasNew" --> result3
+    commit4 --- Commit.Edges.Fixes --> result1
+    commit4 --- Commit.Edges.Introduces --> result3
 
-    commit5 --- "hasUnchanged" --> result3
+    commit5 --- Commit.Edges.Keeps --> result3
 
     println(
       graph
@@ -84,6 +85,16 @@ object Test {
   object Commit {
     val Class: String = "Commit"
     val UUID: Key[String] = Key[String]("uuid")
+
+    object Edges {
+      val Introduces: String = "Introduces"
+      val Fixes: String = "Fixes"
+      val Keeps: String = "Keeps"
+
+      val FirstParent: String = "FirstParent"
+      val SecondParent: String = "SecondParent"
+    }
+
   }
 
   object Pattern {
@@ -97,7 +108,7 @@ object Test {
     val Class: String = "Result"
     val Filename: Key[String] = Key[String]("filename")
     val Line: Key[Int] = Key[Int]("line")
-    val Pattern: Key[ORID] = Key[ORID]("pattern")
+    val Pattern: Key[ORecordId] = Key[ORecordId]("pattern")
   }
 
   object Gen {
@@ -144,36 +155,40 @@ object Test {
           List(
             Result.Filename -> string(10)
             , Result.Line -> int(max = 100000)
-            , Result.Pattern -> pattern.id.asInstanceOf[ORID]
+            , Result.Pattern -> pattern.id.asInstanceOf[ORecordId]
           )
         )
       }(collection.breakOut)
     }
   }
 
-
   def createVertexClasses(graph: OrientGraph): Unit = {
     val schema = graph.getRawDatabase.getMetadata.getSchema
 
     val vClass = schema.getClass("V")
 
-    val commitClass = schema.getOrCreateClass("V_Commit", vClass)
+    val commitClass = schema.createClass(s"V_${Commit.Class}", vClass)
 
-    commitClass.createProperty("UUID", OType.STRING).setMandatory(true)
+    createClassProperty(commitClass, Commit.UUID)
 
+    val patternClass = schema.createClass(s"V_${Pattern.Class}", vClass)
 
-    val patternClass = schema.getOrCreateClass("V_Pattern", vClass)
+    createClassProperty(patternClass, Pattern.InternalId)
+    createClassProperty(patternClass, Pattern.CategoryType)
+    createClassProperty(patternClass, Pattern.Level)
 
-    patternClass.createProperty("internalId", OType.STRING).setMandatory(true)
-    patternClass.createProperty("categoryType", OType.STRING).setMandatory(true)
-    patternClass.createProperty("level", OType.STRING).setMandatory(true)
+    val resultClass = schema.createClass(s"V_${Result.Class}", vClass)
 
+    createClassProperty(resultClass, Result.Filename)
+    createClassProperty(resultClass, Result.Line)
+    createClassProperty(resultClass, Result.Pattern)
+  }
 
-    val resultClass = schema.getOrCreateClass("V_Result", vClass)
-
-    resultClass.createProperty("filename", OType.STRING).setMandatory(true)
-    resultClass.createProperty("line", OType.INTEGER).setMandatory(true)
-    resultClass.createProperty("pattern", OType.LINK).setMandatory(true)
+  private def createClassProperty[T](iClass: OClass, key: Key[T], mandatory: Boolean = true, notNull: Boolean = true)
+                                    (implicit classTag: ClassTag[T]): Unit = {
+    iClass.createProperty(key.name, OType.getTypeByClass(classTag.runtimeClass))
+      .setMandatory(mandatory)
+      .setNotNull(notNull)
   }
 
   def createEdgeClasses(graph: OrientGraph): Unit = {
@@ -183,9 +198,9 @@ object Test {
 
     val interface = schema.createAbstractClass("commitResult", eClass)
 
-    schema.createClass("E_hasUnchanged", interface)
-    schema.createClass("E_hasFixed", interface)
-    schema.createClass("E_hasNew", interface)
+    schema.createClass(s"E_${Commit.Edges.Keeps}", interface)
+    schema.createClass(s"E_${Commit.Edges.Fixes}", interface)
+    schema.createClass(s"E_${Commit.Edges.Introduces}", interface)
   }
 
 
