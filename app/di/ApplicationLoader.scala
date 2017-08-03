@@ -25,10 +25,8 @@ class ApplicationComponents(context: Context)
     with HikariCPComponents
     with HttpFiltersComponents {
 
-  override lazy val evolutionsApi: EvolutionsApi = new OrientDefaultEvolutionsApi(dbApi)
-  override lazy val applicationEvolutions: ApplicationEvolutions = new OrientApplicationEvolutions(evolutionsConfig, evolutionsReader, evolutionsApi, dynamicEvolutions, dbApi, environment, webCommands)
-
-  applicationEvolutions.start()
+  override val evolutionsApi: EvolutionsApi = new OrientDefaultEvolutionsApi(dbApi)
+  override val applicationEvolutions: ApplicationEvolutions = new OrientApplicationEvolutions(evolutionsConfig, evolutionsReader, evolutionsApi, dynamicEvolutions, dbApi, environment, webCommands)
 
   lazy val applicationController = new controllers.ApplicationController(controllerComponents)
 

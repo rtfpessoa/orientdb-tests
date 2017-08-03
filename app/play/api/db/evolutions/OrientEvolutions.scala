@@ -4,7 +4,6 @@
 package play.api.db.evolutions
 
 import java.sql._
-import javax.inject.Singleton
 
 import play.api._
 import play.api.db.evolutions.DatabaseUrlPatterns._
@@ -15,6 +14,7 @@ import play.core.WebCommands
 
 import scala.util.control.Exception.ignoring
 import scala.util.control.NonFatal
+import scala.util.matching.Regex
 
 class OrientApplicationEvolutions(
                                    config: EvolutionsConfig,
@@ -104,23 +104,32 @@ class OrientApplicationEvolutions(
     import ApplicationEvolutions._
     val queries = url match {
       case OracleJdbcUrl() =>
-        Some((SelectPlayEvolutionsLockSql, CreatePlayEvolutionsLockOracleSql, InsertIntoPlayEvolutionsLockSql))
+        Some((SelectPlayEvolutionsLockSql, List(CreatePlayEvolutionsLockOracleSql), InsertIntoPlayEvolutionsLockSql))
       case MysqlJdbcUrl(_) =>
-        Some((SelectPlayEvolutionsLockMysqlSql, CreatePlayEvolutionsLockMysqlSql, InsertIntoPlayEvolutionsLockMysqlSql))
+        Some((SelectPlayEvolutionsLockMysqlSql, List(CreatePlayEvolutionsLockMysqlSql), InsertIntoPlayEvolutionsLockMysqlSql))
       case OrientJdbcUrl() =>
-        None
+        Some(
+          (
+            "select lock from ${schema}play_evolutions_lock",
+            List(
+              "CREATE CLASS ${schema}play_evolutions_lock IF NOT EXISTS",
+              "CREATE PROPERTY ${schema}play_evolutions_lock.lock IF NOT EXISTS INTEGER (MANDATORY TRUE)"
+            ),
+            "insert into ${schema}play_evolutions_lock (`lock`) values (1)"
+          )
+        )
       case _ =>
-        Some((SelectPlayEvolutionsLockSql, CreatePlayEvolutionsLockSql, InsertIntoPlayEvolutionsLockSql))
+        Some((SelectPlayEvolutionsLockSql, List(CreatePlayEvolutionsLockSql), InsertIntoPlayEvolutionsLockSql))
     }
     queries.foreach {
-      case (selectScript, createScript, insertScript) =>
+      case (selectScript, createScripts, insertScript) =>
         try {
           val r = s.executeQuery(applySchema(selectScript, dbConfig.schema))
           r.close()
         } catch {
-          case e: SQLException =>
+          case _: SQLException =>
             c.rollback()
-            s.execute(applySchema(createScript, dbConfig.schema))
+            createScripts.foreach(cs => s.execute(applySchema(cs, dbConfig.schema)))
             s.executeUpdate(applySchema(insertScript, dbConfig.schema))
         }
     }
@@ -153,8 +162,6 @@ class OrientApplicationEvolutions(
     ignoring(classOf[SQLException])(c.close())
   }
 
-  start() // on construction
-
   // SQL helpers
 
   private def applySchema(sql: String, schema: String): String = {
@@ -165,20 +172,19 @@ class OrientApplicationEvolutions(
 /**
   * Default implementation of the evolutions API.
   */
-@Singleton
 class OrientDefaultEvolutionsApi(dbApi: DBApi) extends EvolutionsApi {
 
   private def databaseEvolutions(name: String, schema: String) = new OrientDatabaseEvolutions(dbApi.database(name), schema)
 
-  def scripts(db: String, evolutions: Seq[Evolution], schema: String) = databaseEvolutions(db, schema).scripts(evolutions)
+  def scripts(db: String, evolutions: Seq[Evolution], schema: String): Seq[Script] = databaseEvolutions(db, schema).scripts(evolutions)
 
-  def scripts(db: String, reader: EvolutionsReader, schema: String) = databaseEvolutions(db, schema).scripts(reader)
+  def scripts(db: String, reader: EvolutionsReader, schema: String): Seq[Script] = databaseEvolutions(db, schema).scripts(reader)
 
-  def resetScripts(db: String, schema: String) = databaseEvolutions(db, schema).resetScripts()
+  def resetScripts(db: String, schema: String): Seq[Script] = databaseEvolutions(db, schema).resetScripts()
 
-  def evolve(db: String, scripts: Seq[Script], autocommit: Boolean, schema: String) = databaseEvolutions(db, schema).evolve(scripts, autocommit)
+  def evolve(db: String, scripts: Seq[Script], autocommit: Boolean, schema: String): Unit = databaseEvolutions(db, schema).evolve(scripts, autocommit)
 
-  def resolve(db: String, revision: Int, schema: String) = databaseEvolutions(db, schema).resolve(revision)
+  def resolve(db: String, revision: Int, schema: String): Unit = databaseEvolutions(db, schema).resolve(revision)
 }
 
 /**
@@ -221,16 +227,11 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
   private def databaseEvolutions(): Seq[Evolution] = {
     implicit val connection = database.getConnection(autocommit = true)
 
-    val query = dbUrl match {
-      case OrientJdbcUrl() =>
-        "select id, hash, apply_script, revert_script from ${schema}play_evolutions order by id"
-      case _ =>
-        "select id, hash, apply_script, revert_script from ${schema}play_evolutions order by id"
-    }
-
     try {
       checkEvolutionsState()
-      Collections.unfoldLeft(executeQuery(query)) { rs =>
+      Collections.unfoldLeft(executeQuery(
+        "select id, hash, apply_script, revert_script from ${schema}play_evolutions order by id"
+      )) { rs =>
         if (rs.next) {
           Some(
             (
@@ -248,7 +249,10 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
   }
 
   def evolve(scripts: Seq[Script], autocommit: Boolean): Unit = {
-    def logBefore(script: Script)(implicit conn: Connection): Unit = {
+
+    implicit val connection: Connection = database.getConnection(autocommit = autocommit)
+
+    def logBefore(script: Script): Unit = {
       script match {
         case UpScript(e) =>
           prepareAndExecute(
@@ -270,25 +274,22 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
       }
     }
 
-    def logAfter(script: Script)(implicit conn: Connection): Boolean = {
+    def logAfter(script: Script): Boolean = {
       script match {
-        case UpScript(e) => {
+        case UpScript(e) =>
           execute("update ${schema}play_evolutions set state = 'applied' where id = " + e.revision)
-        }
-        case DownScript(e) => {
+        case DownScript(e) =>
           execute("delete from ${schema}play_evolutions where id = " + e.revision)
-        }
       }
     }
 
-    def updateLastProblem(message: String, revision: Int)(implicit conn: Connection): Boolean = {
+    def updateLastProblem(message: String, revision: Int): Boolean = {
       prepareAndExecute("update ${schema}play_evolutions set last_problem = ? where id = ?") { ps =>
         ps.setString(1, message)
         ps.setInt(2, revision)
       }
     }
 
-    implicit val connection = database.getConnection(autocommit = autocommit)
     checkEvolutionsState()
 
     var applying = -1
@@ -310,7 +311,7 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
       }
 
     } catch {
-      case NonFatal(e) => {
+      case NonFatal(e) =>
         val message = e match {
           case ex: SQLException => ex.getMessage + " [ERROR:" + ex.getErrorCode + ", SQLSTATE:" + ex.getSQLState + "]"
           case ex => ex.getMessage
@@ -326,7 +327,6 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
         } else {
           updateLastProblem(message, applying)
         }
-      }
     } finally {
       connection.close()
     }
@@ -349,14 +349,14 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
           case DerbyJdbcUrl() => List(CreatePlayEvolutionsDerby)
           case OrientJdbcUrl() =>
             List(
-              "CREATE CLASS play_evolutions IF NOT EXISTS",
-              "CREATE PROPERTY play_evolutions.id IF NOT EXISTS INTEGER (MANDATORY TRUE)",
-              "CREATE PROPERTY play_evolutions.hash IF NOT EXISTS STRING (MANDATORY TRUE)",
-              "CREATE PROPERTY play_evolutions.applied_at IF NOT EXISTS DATETIME (MANDATORY TRUE)",
-              "CREATE PROPERTY play_evolutions.apply_script IF NOT EXISTS STRING",
-              "CREATE PROPERTY play_evolutions.revert_script IF NOT EXISTS STRING",
-              "CREATE PROPERTY play_evolutions.state IF NOT EXISTS STRING",
-              "CREATE PROPERTY play_evolutions.last_problem IF NOT EXISTS STRING"
+              "CREATE CLASS ${schema}play_evolutions IF NOT EXISTS",
+              "CREATE PROPERTY ${schema}play_evolutions.id IF NOT EXISTS INTEGER (MANDATORY TRUE)",
+              "CREATE PROPERTY ${schema}play_evolutions.hash IF NOT EXISTS STRING (MANDATORY TRUE)",
+              "CREATE PROPERTY ${schema}play_evolutions.applied_at IF NOT EXISTS DATETIME (MANDATORY TRUE)",
+              "CREATE PROPERTY ${schema}play_evolutions.apply_script IF NOT EXISTS STRING",
+              "CREATE PROPERTY ${schema}play_evolutions.revert_script IF NOT EXISTS STRING",
+              "CREATE PROPERTY ${schema}play_evolutions.state IF NOT EXISTS STRING",
+              "CREATE PROPERTY ${schema}play_evolutions.last_problem IF NOT EXISTS STRING"
             )
           case _ => List(CreatePlayEvolutionsSql)
         }
@@ -416,29 +416,14 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
   // SQL helpers
 
   private def executeQuery(sql: String)(implicit c: Connection): ResultSet = {
-    println("")
-    println("###")
-    println("")
-    println(sql)
-    println("")
     c.createStatement.executeQuery(applySchema(sql))
   }
 
   private def execute(sql: String)(implicit c: Connection): Boolean = {
-    println("")
-    println("***")
-    println("")
-    println(sql)
-    println("")
     c.createStatement.execute(applySchema(sql))
   }
 
   private def prepareAndExecute(sql: String)(block: PreparedStatement => Unit)(implicit c: Connection) = {
-    println("")
-    println("$$$")
-    println("")
-    println(sql)
-    println("")
     val ps = c.prepareStatement(applySchema(sql))
     try {
       block(ps)
@@ -458,5 +443,5 @@ class OrientDatabaseEvolutions(database: Database, schema: String = "") {
   * Defines database url patterns.
   */
 private[evolutions] object OrientDatabaseUrlPatterns {
-  lazy val OrientJdbcUrl = "^jdbc:orient:.*".r
+  lazy val OrientJdbcUrl: Regex = "^jdbc:orient:.*".r
 }
